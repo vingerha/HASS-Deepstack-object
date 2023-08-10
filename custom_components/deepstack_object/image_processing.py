@@ -71,6 +71,8 @@ CONF_SAVE_FILE_FOLDER = "save_file_folder"
 CONF_SAVE_TIMESTAMPTED_FILE = "save_timestamped_file"
 CONF_ALWAYS_SAVE_LATEST_FILE = "always_save_latest_file"
 CONF_SHOW_BOXES = "show_boxes"
+CONF_PREV_OBJECTS_IGNORE = "prev_objects_ignore"    #giddy - boolean
+CONF_PREV_OBJECTS_PCT = "prev_objects_pct"  #giddy - 0-100% PERCENTAGE difference to ignore prev objects                                                              
 CONF_ROI_Y_MIN = "roi_y_min"
 CONF_ROI_X_MIN = "roi_x_min"
 CONF_ROI_Y_MAX = "roi_y_max"
@@ -79,10 +81,11 @@ CONF_SCALE = "scale"
 CONF_CUSTOM_MODEL = "custom_model"
 CONF_CROP_ROI = "crop_to_roi"
 
-DATETIME_FORMAT = "%Y-%m-%d_%H-%M-%S-%f"
+DATETIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 DEFAULT_API_KEY = ""
 DEFAULT_TARGETS = [{CONF_TARGET: PERSON}]
 DEFAULT_TIMEOUT = 10
+DEFAULT_PREV_OBJECTS_PCT = 0.02
 DEFAULT_ROI_Y_MIN = 0.0
 DEFAULT_ROI_Y_MAX = 1.0
 DEFAULT_ROI_X_MIN = 0.0
@@ -106,7 +109,9 @@ PNG = "png"
 
 # rgb(red, green, blue)
 RED = (255, 0, 0)  # For objects within the ROI
-GREEN = (0, 255, 0)  # For ROI box
+GREEN = (0, 255, 0)  # For ignored objects previously detected
+PURPLE = (170, 0, 255)    # For vehicles
+SILVER = (192, 192, 192)  #giddy - For ROI box
 YELLOW = (255, 255, 0)  # Unused
 
 TARGETS_SCHEMA = {
@@ -139,6 +144,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_SAVE_TIMESTAMPTED_FILE, default=False): cv.boolean,
         vol.Optional(CONF_ALWAYS_SAVE_LATEST_FILE, default=False): cv.boolean,
         vol.Optional(CONF_SHOW_BOXES, default=True): cv.boolean,
+        vol.Optional(CONF_PREV_OBJECTS_IGNORE, default=True): cv.boolean,
+        vol.Optional(CONF_PREV_OBJECTS_PCT, default=DEFAULT_PREV_OBJECTS_PCT): cv.small_float,
         vol.Optional(CONF_CROP_ROI, default=False): cv.boolean,
     }
 )
@@ -235,6 +242,8 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
             roi_x_max=config[CONF_ROI_X_MAX],
             scale=config[CONF_SCALE],
             show_boxes=config[CONF_SHOW_BOXES],
+            prev_objs_ignore=config[CONF_PREV_OBJECTS_IGNORE],
+            prev_objs_pct=config[CONF_PREV_OBJECTS_PCT],
             save_file_folder=save_file_folder,
             save_file_format=config[CONF_SAVE_FILE_FORMAT],
             save_timestamped_file=config.get(CONF_SAVE_TIMESTAMPTED_FILE),
@@ -265,6 +274,8 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         roi_x_max,
         scale,
         show_boxes,
+        prev_objs_ignore,
+        prev_objs_pct,
         save_file_folder,
         save_file_format,
         save_timestamped_file,
@@ -303,6 +314,12 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         self._state = None
         self._objects = []  # The parsed raw data
         self._targets_found = []
+        self._targets_last = {} # used for storing the previous/last objects
+        self._targets_last[self._camera] = []
+        self._targets_latest = {} # used for comparing latest objects
+        self._targets_latest[self._camera] = []
+        self._last_detection = None
+        self._last_filename = None                                   
         self._last_detection = None
 
         self._roi_dict = {
@@ -314,6 +331,8 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         self._crop_roi = crop_roi
         self._scale = scale
         self._show_boxes = show_boxes
+        self._prev_objs_ignore = prev_objs_ignore
+        self._prev_objs_pct = prev_objs_pct
         self._image_width = None
         self._image_height = None
         self._save_file_folder = save_file_folder
@@ -373,7 +392,15 @@ class ObjectClassifyEntity(ImageProcessingEntity):
 
         self._objects = get_objects(predictions, self._image_width, self._image_height)
         self._targets_found = []
+        real_targets_found = []     #only real targets excluding ignored targets
+        latest_targets_cp = {}    #make copy of _targets_latest and pop matches, so its faster
+        if self._targets_latest and self._camera in self._targets_latest:
+            latest_targets_cp = self._targets_latest[self._camera]
+            self._targets_last[self._camera] = self._targets_latest[self._camera]   #set the last targets to the existing latest
 
+        confidence = DEFAULT_CONFIDENCE
+        ignore_count = 0
+        target_count = 0
         for obj in self._objects:
             if not (
                 (obj["name"] in self._targets_names)
@@ -392,16 +419,49 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             if obj["confidence"] > confidence:
                 if not self._crop_roi and not object_in_roi(self._roi_dict, obj["centroid"]):
                     continue
+                # Ignore target if it was previously detected
+                ignore = "false"
+                if self._prev_objs_ignore:
+                    for last in latest_targets_cp:
+                        if obj["name"] == last['name']:     #FIXED CRASH here cuz last contains keys, should be last['name']
+                            objBox = obj["bounding_box"]
+                            lasBox = last["bounding_box"]
+                            if (round(abs(objBox["x_min"]-lasBox["x_min"]),5) < self._prev_objs_pct) \
+                            and (round(abs(objBox["x_max"]-lasBox["x_max"]),5) < self._prev_objs_pct) \
+                            and (round(abs(objBox["y_min"]-lasBox["y_min"]),5) < self._prev_objs_pct) \
+                            and (round(abs(objBox["y_max"]-lasBox["y_max"]),5) < self._prev_objs_pct):
+                                ignore = "true"
+                                ignore_count += 1
+                                break
+                        else: continue
+
+                obj["ignore"] = ignore
+                obj["ignoreCount"] = ignore_count
                 self._targets_found.append(obj)
 
-        self._state = len(self._targets_found)
-        if self._state > 0:
-            self._last_detection = dt_util.now().strftime(DATETIME_FORMAT)
+                if ignore == "false": 
+                    target_count += 1
+                    real_targets_found.append(obj)
 
-        targets_found = [
-            obj["name"] for obj in self._targets_found
+        #END for obj in self._objects
+
+        real_targets_found = [
+            obj["name"] for obj in real_targets_found   #self._targets_found
         ]  # Just the list of target names, e.g. [car, car, person]
-        self._summary = dict(Counter(targets_found))  # e.g. {'car':2, 'person':1}
+        self._summary = dict(Counter(real_targets_found))  # e.g. {'car':2, 'person':1}
+
+        target_event_data = {}
+        self._state = target_count  #len(self._targets_found)
+        if self._state > 0:
+            # Set last_detection time
+            self._last_detection = dt_util.now().strftime(DATETIME_FORMAT)
+            # Fire 1 event of all detected objects, with 'targets_found' and 'summary'
+            target_event_data[ATTR_ENTITY_ID] = self.entity_id
+            target_event_data["targets_found"] = real_targets_found
+            target_event_data["summary"] = self._summary
+            if saved_image_path:
+                target_event_data[SAVED_FILE] = saved_image_path
+            self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
 
         if self._save_file_folder:
             if self._state > 0 or self._always_save_latest_file:
@@ -410,13 +470,14 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                     self._save_file_folder,
                 )
 
-        # Fire events
-        for target in self._targets_found:
-            target_event_data = target.copy()
-            target_event_data[ATTR_ENTITY_ID] = self.entity_id
-            if saved_image_path:
-                target_event_data[SAVED_FILE] = saved_image_path
-            self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
+        # for target in self._targets_found:
+        #     target_event_data = target.copy()
+        #     target_event_data[ATTR_ENTITY_ID] = self.entity_id
+        #     if saved_image_path:
+        #         target_event_data[SAVED_FILE] = saved_image_path
+        #     self.hass.bus.fire(EVENT_OBJECT_DETECTED, target_event_data)
+
+        self._targets_latest[self._camera] = self._targets_found    #save the targets for next time
 
     @property
     def camera_entity(self):
@@ -448,16 +509,21 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         """Return device specific state attributes."""
         attr = {}
         attr["targets"] = self._targets
+        attr["targets_last"] = [
+            {obj["name"]: obj["confidence"], "bounding_box": obj["bounding_box"]} for obj in self._targets_last[self._camera]
+        ]
         attr["targets_found"] = [
-            {obj["name"]: obj["confidence"]} for obj in self._targets_found
+            {obj["name"]: obj["confidence"], "bounding_box": obj["bounding_box"], "ignore": obj["ignore"]} for obj in self._targets_found
         ]
         attr["summary"] = self._summary
         if self._last_detection:
             attr["last_target_detection"] = self._last_detection
+        if self._last_filename:
+            attr["last_filename"] = str(self._last_filename)    #convert path to str otherwise will get error "Object of type PosixPath is not JSON serializable"
         if self._custom_model:
             attr["custom_model"] = self._custom_model
         attr["all_objects"] = [
-            {obj["name"]: obj["confidence"]} for obj in self._objects
+            {obj["name"]: obj["confidence"], "bounding_box": obj["bounding_box"]} for obj in self._objects
         ]
         if self._save_file_folder:
             attr[CONF_SAVE_FILE_FOLDER] = str(self._save_file_folder)
@@ -486,7 +552,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 img.width,
                 img.height,
                 text="ROI",
-                color=GREEN,
+                color=SILVER,
             )
 
         for obj in targets:
@@ -496,7 +562,12 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             confidence = obj["confidence"]
             box = obj["bounding_box"]
             centroid = obj["centroid"]
-            box_label = f"{name}: {confidence:.1f}%"
+            box_label = f"{name}: {confidence:.0f}%"
+            boxColor = PURPLE
+            if obj["ignore"] == "true":
+                boxColor = GREEN
+            elif obj["object_type"]==PERSON:
+                boxColor = RED
 
             draw_box(
                 draw,
@@ -504,20 +575,20 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 img.width,
                 img.height,
                 text=box_label,
-                color=RED,
+                color=boxColor,
             )
 
             # draw bullseye
             draw.text(
                 (centroid["x"] * img.width, centroid["y"] * img.height),
                 text="X",
-                fill=RED,
+                fill=boxColor,
             )
 
         # Save images, returning the path of saved image as str
         latest_save_path = (
             directory
-            / f"{get_valid_filename(self._name).lower()}_latest.{self._save_file_format}"
+            / f"{get_valid_filename(self._name.replace('deepstack_object_', '')).lower()}_latest.{self._save_file_format}"
         )
         img.save(latest_save_path)
         _LOGGER.info("Deepstack saved file %s", latest_save_path)
@@ -526,9 +597,13 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         if self._save_timestamped_file:
             timestamp_save_path = (
                 directory
-                / f"{self._name}_{self._last_detection}.{self._save_file_format}"
+                / f"{self._name.replace('deepstack_object_', '')}_{self._last_detection}.{self._save_file_format}"
             )
             img.save(timestamp_save_path)
             _LOGGER.info("Deepstack saved file %s", timestamp_save_path)
             saved_image_path = timestamp_save_path
+
+        # Only update last_filename if state > 0
+        if (self._state > 0): self._last_filename = saved_image_path
+
         return str(saved_image_path)
