@@ -61,6 +61,8 @@ Configuration variables:
 - **always_save_latest_file**: (Optional, default `False`, requires `save_file_folder` to be configured) Always save the last processed image, even if there were no detections.
 - **scale**: (optional, default 1.0), range 0.1-1.0, applies a scaling factor to the images that are saved. This reduces the disk space used by saved images, and is especially beneficial when using high resolution cameras.
 - **show_boxes**: (optional, default `True`), if `False` bounding boxes are not shown on saved images
+- **prev_objects_ignore**: (optional, default true) Ignore objects if it's bounding box is within prev_objs_pct % difference. Ignored objects are green color.
+- **prev_objects_pct**: (optional, default 0.02) The percentage plus or minus difference of bounding box to be ignored if prev_objs_ignore set to true.
 - **roi_x_min**: (optional, default 0), range 0-1, must be less than roi_x_max
 - **roi_x_max**: (optional, default 1), range 0-1, must be more than roi_x_min
 - **roi_y_min**: (optional, default 0), range 0-1, must be less than roi_y_max
